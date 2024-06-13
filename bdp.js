@@ -3,9 +3,6 @@ let button = null
 let downloadStop = null
 let downloadStart = null
 
-browser.runtime.onMessage.addListener(messageListener)
-browser.runtime.sendMessage({ command: 'start' })
-
 onElementAvailable('.it-brand-wrapper', initialize)
 
 function onElementAvailable(selector, callback) {
@@ -44,7 +41,10 @@ function initialize(event) {
     button = document.getElementById('download-button')
     downloadStop = document.getElementById('download-stop')
     downloadStart = document.getElementById('download-start')
+
     button.addEventListener('click', downloadListener)
+    browser.runtime.onMessage.addListener(messageListener)
+    browser.runtime.sendMessage({ command: 'start' })
 }
 
 function messageListener(message, sender, sendResponse) {
