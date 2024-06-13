@@ -1,9 +1,6 @@
-const base_url = "https://bdp.giustizia.it/api/bdm/frontoffice/"
+const base_url = 'https://bdp.giustizia.it/api/bdm/frontoffice/'
 
-let jwt = null
-let query = null
-
-QUERY_SEARCH_PROVVEDIMENTO = `
+const QUERY_SEARCH_PROVVEDIMENTO = `
 query searchProvvedimento($from: Int, $size: Int, $area: String, $q: String, $sort_field: String, $sort_order: String, $collated: Boolean, $note_personali: String) {
   provvedimento(
     from: $from
@@ -142,8 +139,18 @@ fragment SearchProvvedimentoResultItem on Provvedimento {
 }
 `
 
+browser.webRequest.onBeforeRequest.addListener(
+    networkRequestsListener,
+    { urls: [base_url + 'graphql'] },
+    ['requestBody', 'blocking']
+)
+
+browser.runtime.onMessage.addListener(messageListener)
+
+let queries = {}
+
 function parseCookies(header) {
-    dict = {}
+    const dict = {}
     const cookies = header.split(';')
     for (let cookie of cookies) {
         let [name, value] = cookie.split('=').map(part => part.trim())
@@ -152,97 +159,128 @@ function parseCookies(header) {
     return dict
 }
 
-function logRequestDetails(details) {
-    if (details.requestHeaders) {
-        for (let header of details.requestHeaders) {
-            if (header.name.toLowerCase() === "cookie") {
-                let cookies = parseCookies(header.value)
-                jwt = cookies['jwt_bdm_frontoffice']
-                console.log(jwt)
-            }
-        }
-    }
-
-    if (details.requestBody) {
-        let requestBody = details.requestBody;
+function networkRequestsListener(requestDetails) {
+    const tabId = requestDetails.tabId
+    if (tabId == -1) return
+    if (requestDetails.requestBody) {
+        const requestBody = requestDetails.requestBody
         if (requestBody.raw) {
-            let decoder = new TextDecoder("utf-8");
-            let body = requestBody.raw.map((part) => decoder.decode(part.bytes)).join('');
-            let data = JSON.parse(body)
-            query = data.variables.q
-            console.log(query)
+            const decoder = new TextDecoder('utf-8')
+            const body = JSON.parse(requestBody.raw.map((part) => decoder.decode(part.bytes)).join(''))
+            const query = body.variables.q
+            queries[tabId] = query
         }
-    }
-}
 
-browser.webRequest.onBeforeSendHeaders.addListener(
-    logRequestDetails,
-    { urls: [base_url + "*"] },
-    ["requestHeaders"]
-);
+        const data = []
+        const filter = browser.webRequest.filterResponseData(requestDetails.requestId)
+        filter.ondata = event => {
+            data.push(event.data)
+            filter.write(event.data)
+        }
 
-browser.webRequest.onBeforeRequest.addListener(
-    logRequestDetails,
-    { urls: [base_url + "*"] },
-    ["requestBody"]
-);
-
-browser.runtime.onMessage.addListener((message, sender, sendResponse) => downloadProvvedimenti(message))
-
-async function downloadProvvedimenti(message) {
-    console.log(message)
-    if (message.command === "downloadList" && query !== null) {
-        const items = await searchProvvedimenti(query)
-        console.log('Total count2: ' + items.data.provvedimento.count)
-        console.log('Real count: ' + items.data.provvedimento.items.length)
-        for (const item of items.data.provvedimento.items) {
-            try {
-                const downloadId = await browser.downloads.download({
-                    url: base_url + 'provvedimento/' + item.id + '/document',
-                    filename: item.id + ".pdf",
-                    conflictAction: "uniquify"
-                })
-                const downloadPromise = new Promise((resolve, reject) => {
-                    function onChanged(delta) {
-                        if (delta.id === downloadId && delta.state && delta.state.current === "complete") {
-                            browser.downloads.onChanged.removeListener(onChanged);
-                            console.log(`Completed downloading: ${downloadId}`);
-                            resolve();
-                        } else if (delta.id === downloadId && delta.error) {
-                            browser.downloads.onChanged.removeListener(onChanged);
-                            console.error(`Error downloading ${url}: ${delta.error.current}`);
-                            reject(delta.error.current);
-                        }
-                    }
-                    browser.downloads.onChanged.addListener(onChanged);
-                })
-                await downloadPromise
-            } catch (error) {
-                console.error(`Error downloading ${url}: ${error}`);
+        filter.onstop = event => {
+            let concatenated = new Uint8Array(data.reduce((acc, part) => acc + part.byteLength, 0))
+            let offset = 0;
+            for (let part of data) {
+                concatenated.set(new Uint8Array(part), offset)
+                offset += part.byteLength
             }
+            const response = JSON.parse(new TextDecoder('utf-8').decode(concatenated))
+            browser.tabs.sendMessage(tabId, { command: 'storeQuery', query: queries[tabId], total: response.data.provvedimento.count })
+            filter.disconnect()
         }
+    }
+    return {}
+}
+
+function messageListener(message, sender, sendResponse) {
+    console.log(message)
+    switch (message.command) {
+        case 'start':
+            break
+        case 'download':
+            downloadProvvedimenti(sender.tab.id, message.start, message.stop)
+            break
+        default:
+            console.error('Unknown command: ' + message.command)
     }
 }
 
-async function searchProvvedimenti(query, start = 0, size = 2) {
+async function downloadProvvedimenti(tabId, start, stop) {
+    query = queries[tabId]
+    if (query == null) return
+    browser.tabs.sendMessage(tabId, { command: "startDownload" })
+    let all_items = []
+    let current_item = start
+    let downloaded = 0
+    while (current_item <= stop) {
+        const response = await searchProvvedimenti(query, current_item-1, stop - current_item + 1)
+        const items = response.data.provvedimento.items
+        all_items = all_items.concat(items)
+        for (const item of items) {
+            browser.tabs.sendMessage(tabId, { command: 'progressDownload', current: current_item, total: stop })
+            const url = base_url + 'provvedimento/' + item.id + '/document'
+            const filename = item.id + ".pdf"
+            const donwloadItems = await browser.downloads.search({ url: url, limit: 1, exists: true })
+            if (donwloadItems.length == 0) {
+                downloaded += 1
+                try {
+                    const downloadId = await browser.downloads.download({
+                        url: url,
+                        filename: filename,
+                        conflictAction: 'overwrite',
+                    })
+                    const downloadPromise = new Promise((resolve, reject) => {
+                        function onChanged(delta) {
+                            if (delta.id === downloadId && delta.state && delta.state.current === "complete") {
+                                browser.downloads.onChanged.removeListener(onChanged);
+                                console.log(`Completed downloading: ${downloadId}`);
+                                resolve();
+                            } else if (delta.id === downloadId && delta.error) {
+                                browser.downloads.onChanged.removeListener(onChanged);
+                                console.error(`Error downloading ${url}: ${delta.error.current}`);
+                                reject(delta.error.current);
+                            }
+                        }
+                        browser.downloads.onChanged.addListener(onChanged)
+                    })
+                    await downloadPromise
+                } catch (error) {
+                    console.error(`Error downloading ${url}: ${error}`)
+                }
+            }
+            current_item += 1
+        }
+    }
+    const blob = new Blob([JSON.stringify(all_items, null, 2)], { type: 'application/json' })
+    const url = URL.createObjectURL(blob)
+    await browser.downloads.download({
+        url: url,
+        filename: 'results.json',
+        conflictAction: 'overwrite',
+    })
+    browser.tabs.sendMessage(tabId, { command: 'stopDownload', current: current_item - 1, total: stop, downloaded: downloaded })
+}
+
+async function searchProvvedimenti(query, start = 0, size = 10) {
     const query_json = {
-        "operationName": "searchProvvedimento",
-        "variables": {
-            "from": start,
-            "size": size,
-            "note_personali": null,
-            "area": "CIVILE",
-            "q": query,
-            "sort_field": "data",
-            "sort_order": "desc",
-            "collated": false,
+        'operationName': 'searchProvvedimento',
+        'variables': {
+            'from': start,
+            'size': size,
+            'note_personali': null,
+            'area': 'CIVILE',
+            'q': query,
+            'sort_field': 'data',
+            'sort_order': 'desc',
+            'collated': false,
         },
-        "query": QUERY_SEARCH_PROVVEDIMENTO
+        'query': QUERY_SEARCH_PROVVEDIMENTO
     }
     const params = {
-        method: "POST",
+        method: 'POST',
         headers: {
-            "Content-Type": "application/json",
+            'Content-Type': 'application/json',
         },
         body: JSON.stringify(query_json)
     }
