@@ -1,5 +1,5 @@
 {
-  "manifest_version": 2,
+  "manifest_version": 3,
   "name": "BdP Giustizia Auto-Downloader",
   "version": "1.0",
   "description": "Automatically downloads documents from the BdP Giustizia website.",
@@ -7,6 +7,9 @@
     "downloads",
     "webRequest",
     "webRequestBlocking",
+    "webRequestFilterResponse"
+  ],
+  "host_permissions": [
     "*://bdp.giustizia.it/*"
   ],
   "background": {
