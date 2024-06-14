@@ -26,5 +26,10 @@
         "bdp.js"
       ]
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "bdp-downloader@unich.it"
+    }
+  }
 }
